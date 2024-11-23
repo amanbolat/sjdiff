@@ -1,0 +1,27 @@
+[package]
+name = "sjdiff"
+description = "Structural JSON Diff Library for Rust"
+version = "0.0.5"
+license = "MIT"
+edition = "2021"
+documentation = "https://docs.rs/sjdiff"
+repository = "https://github.com/amanbolat/sjdiff"
+keywords = ["diff", "json", "serde", "serde_json"]
+
+[package.metadata.docs.rs]
+cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
+
+[dependencies]
+approx = "0.5.1"
+chrono = "0.4.38"
+derive_builder = "0.20.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+insta = "1.28.0"
+
+[[example]]
+name = "simple_object_diff"
+path = "examples/simple_object_diff.rs"
+doc-scrape-examples = true

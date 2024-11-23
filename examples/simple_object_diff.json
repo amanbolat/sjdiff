@@ -1,0 +1,13 @@
+{
+  "difference_of": "object",
+  "different_entries": {
+    "age": {
+      "entry_difference": "value",
+      "value_diff": {
+        "difference_of": "scalar",
+        "source": 31,
+        "target": 33
+      }
+    }
+  }
+}
