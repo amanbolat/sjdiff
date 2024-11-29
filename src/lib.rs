@@ -288,16 +288,23 @@ impl Diff {
                 self.values(source, target).map(|diff| (key, EntryDifference::Value { value_diff: diff }))
             })
             .collect::<Vec<_>>();
-
+        
         if !is_first { self.curr_path.pop(); }
 
-        value_differences.extend(target.into_iter().map(|(missing_key, missing_value)| {
-            (
-                missing_key,
-                EntryDifference::Missing {
+        value_differences.extend(target.into_iter().filter_map(|(missing_key, missing_value)| {
+            let elem_path = PathElement::Key(missing_key.clone());
+            self.curr_path.push(elem_path);
+            let ignore = self.ignore_path(false);
+            
+            let res = match ignore {
+                true => None,
+                false => Some((missing_key, EntryDifference::Missing {
                     value: missing_value,
-                },
-            )
+                })),
+            };
+            
+            self.curr_path.pop();
+            res
         }));
 
         match value_differences.is_empty() {
@@ -405,16 +412,22 @@ impl Diff {
         }
     }
 
-    fn ignore_path(&self, target_has_key: bool) -> bool {
+    /// Returns true if the current path should be ignored.
+    /// `has_key` indicates if the opposite object has the key.
+    /// So, if the function is called when the keys of source are iterated
+    /// target should be checked for key existence.
+    /// After it can only be called on vector of target keys, which
+    /// means that all those keys are missing on the source. 
+    fn ignore_path(&self, has_key: bool) -> bool {
         let path = self.ignore_paths.iter().find(|p| p.0.eq(&self.curr_path));
 
         match path {
             Some(IgnorePath(path, _))
-            if path.eq(&self.curr_path) && target_has_key => true,
+            if path.eq(&self.curr_path) && has_key => true,
             Some(IgnorePath(path, ignore_missing))
-            if path.eq(&self.curr_path) && !target_has_key && *ignore_missing => true,
+            if path.eq(&self.curr_path) && !has_key && *ignore_missing => true,
             Some(IgnorePath(path, ignore_missing))
-            if path.eq(&self.curr_path) && !target_has_key && !ignore_missing => false,
+            if path.eq(&self.curr_path) && !has_key && !ignore_missing => false,
             _ => false,
         }
     }
@@ -504,6 +517,27 @@ mod tests {
     use std::time::Duration;
     use serde_json::json;
     use crate::DiffBuilder;
+
+    #[test]
+    fn ignore_source_missing() {
+        let obj1 = json!({
+            "name": "John Doe",
+        });
+
+        let obj2 = json!({
+            "name": "John Doe",
+            "age": 30
+        });
+
+        let diff = DiffBuilder::default()
+            .source(obj1)
+            .target(obj2)
+            .ignore_path_with_missing("age", true)
+            .build();
+        let diff = diff.unwrap().compare();
+
+        assert!(diff.is_none(), "{:?}", diff);
+    }
 
     #[test]
     fn equal_objects() {
