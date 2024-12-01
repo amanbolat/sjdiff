@@ -15,6 +15,7 @@
 #![doc = include_str!("../examples/simple_object_diff.json")]
 //! ```
 mod element_path_parser;
+mod rhai_script;
 
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
@@ -199,8 +200,27 @@ impl DiffBuilder {
     /// be ignored if it's missing in the source or target.
     /// See documentation for [`DiffBuilder::ignore_path`] for usage examples.
     pub fn ignore_path_with_missing(&mut self, path: &str, ignore_missing: bool) -> &mut Self {
-        if let Ok(elements) = Path::from_str(path) {
-            self.ignore_paths.get_or_insert_with(Vec::new).push(IgnorePath(elements, ignore_missing));
+        if let Ok(path) = Path::from_str(path) {
+            let ignore_path = IgnorePathBuilder::default()
+                .path(path)
+                .ignore_missing(ignore_missing)
+                .build()
+                .unwrap();
+            self.ignore_paths.get_or_insert_with(Vec::new).push(ignore_path);
+        }
+        self
+    }
+
+    /// Does the same as [`DiffBuilder::ignore_path`] but you can pass a custom script as a condition.
+    /// See the example `ignore_with_rhai_script.rs` to learn how to use it.
+    pub fn ignore_path_with_condition(&mut self, path: &str, condition: IgnorePathCondition) -> &mut Self {
+        if let Ok(path) = Path::from_str(path) {
+            let ignore_path = IgnorePathBuilder::default()
+                .path(path)
+                .condition(condition)
+                .build()
+                .unwrap();
+            self.ignore_paths.get_or_insert_with(Vec::new).push(ignore_path);
         }
         self
     }
@@ -288,21 +308,21 @@ impl Diff {
                 self.values(source, target).map(|diff| (key, EntryDifference::Value { value_diff: diff }))
             })
             .collect::<Vec<_>>();
-        
+
         if !is_first { self.curr_path.pop(); }
 
         value_differences.extend(target.into_iter().filter_map(|(missing_key, missing_value)| {
             let elem_path = PathElement::Key(missing_key.clone());
             self.curr_path.push(elem_path);
             let ignore = self.ignore_path(false);
-            
+
             let res = match ignore {
                 true => None,
                 false => Some((missing_key, EntryDifference::Missing {
                     value: missing_value,
                 })),
             };
-            
+
             self.curr_path.pop();
             res
         }));
@@ -417,18 +437,35 @@ impl Diff {
     /// So, if the function is called when the keys of source are iterated
     /// target should be checked for key existence.
     /// After it can only be called on vector of target keys, which
-    /// means that all those keys are missing on the source. 
+    /// means that all those keys are missing on the source.
     fn ignore_path(&self, has_key: bool) -> bool {
-        let path = self.ignore_paths.iter().find(|p| p.0.eq(&self.curr_path));
+        let path = self.ignore_paths.iter().find(|p| p.path.eq(&self.curr_path));
+        let path = if let Some(path) = path {path} else {return false;};
 
-        match path {
-            Some(IgnorePath(path, _))
-            if path.eq(&self.curr_path) && has_key => true,
-            Some(IgnorePath(path, ignore_missing))
-            if path.eq(&self.curr_path) && !has_key && *ignore_missing => true,
-            Some(IgnorePath(path, ignore_missing))
-            if path.eq(&self.curr_path) && !has_key && !ignore_missing => false,
-            _ => false,
+        match (path.conditions.len() > 0, path.ignore_missing, has_key) {
+            (true, _, _) => {
+                path.conditions.iter().any(|condition: &IgnorePathCondition| {
+                    match condition {
+                        IgnorePathCondition::Rhai(script) => {
+                            let mut engine = rhai::Engine::new();
+                            engine.register_fn("value_by_path", rhai_script::value_by_path);
+                            let source = engine.parse_json(self.source.to_string(), true).unwrap();
+                            let target = engine.parse_json(self.target.to_string(), true).unwrap();
+                            let mut scope = rhai::Scope::new();
+                            scope.push("source", source);
+                            scope.push("target", target);
+                            scope.push("curr_path", self.curr_path.clone());
+
+                            let result = engine.eval_with_scope::<bool>(&mut scope, script.as_str());
+                            result.unwrap_or(false)
+                        }
+                    }
+                })
+            },
+            (false, false, true) => true,
+            (false, true, false) => true,
+            (false, false, false) => false,
+            (_, _, _) => false
         }
     }
 }
@@ -458,19 +495,40 @@ impl PartialEq for ArrayIndex {
 }
 
 #[derive(Eq, Clone, Debug)]
+#[derive(PartialOrd, Ord)]
 pub enum ArrayIndex {
     Index(usize),
     All,
 }
 
-#[derive(Eq, PartialEq, Clone, Debug)]
+#[derive(Eq, PartialEq, Clone, Debug, Ord, PartialOrd)]
 pub enum PathElement {
     Key(String),
     ArrayIndex(ArrayIndex),
 }
 
-#[derive(PartialEq, Clone, Debug)]
-pub struct IgnorePath(pub Path, pub bool);
+#[derive(PartialEq, Clone, Debug, Builder)]
+pub struct IgnorePath {
+    path: Path,
+
+    #[builder(default = false)]
+    ignore_missing: bool,
+
+    #[builder(default = vec![])]
+    conditions: Vec<IgnorePathCondition>
+}
+
+impl IgnorePathBuilder {
+    pub fn condition(&mut self, condition: IgnorePathCondition) -> &mut Self {
+        self.conditions.get_or_insert_with(Vec::new).push(condition);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IgnorePathCondition {
+    Rhai(String)
+}
 
 #[derive(PartialEq, Clone, Debug, Default)]
 pub struct Path(Vec<PathElement>);
@@ -480,6 +538,45 @@ impl Deref for Path {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl FromIterator<PathElement> for Path {
+    fn from_iter<T: IntoIterator<Item=PathElement>>(iter: T) -> Self {
+        let mut path = Path::default();
+        for element in iter {
+            path.push(element);
+        }
+
+        path
+    }
+}
+
+impl Path {
+    fn replace_array_index_all_by_exact_path(&self, exact_path: Path) -> Option<Path> {
+        if exact_path.iter().any(|elem| {
+            match  elem {
+                PathElement::ArrayIndex(ArrayIndex::All) => true,
+                _ => false
+            }
+        }) {
+            return None
+        }
+
+        let res = self.iter().zip(0..self.len()).map_while(|(elem, idx)| {
+            match elem {
+                PathElement::ArrayIndex(ArrayIndex::All) => {
+                    exact_path.get(idx).cloned()
+                },
+                _ => Some(elem.clone())
+            }
+        }).collect::<Path>();
+
+        if res.len() != self.len() {
+            return None
+        }
+
+        Some(res)
     }
 }
 
@@ -516,7 +613,56 @@ impl TryFrom<&str> for Path {
 mod tests {
     use std::time::Duration;
     use serde_json::json;
-    use crate::DiffBuilder;
+    use crate::{ArrayIndex, DiffBuilder, IgnorePathCondition, Path, PathElement};
+
+    #[test]
+    fn ignore_with_rhai_condition() {
+        let obj1 = json!({
+            "users": [
+                {
+                    "name": "Joe",
+                    "age": 43,
+                },
+                {
+                    "name": "Ana",
+                    "age": 33,
+                    "animals": {
+                        "type": "dog"
+                    }
+                },
+            ]
+        });
+
+        let obj2 = json!({
+            "users": [
+                {
+                    "name": "Joe",
+                    "age": 43,
+                },
+                {
+                    "name": "Ana",
+                    "age": 33,
+                    "animals": {
+                        "type": "cat"
+                    }
+                },
+            ]
+        });
+
+        let script = r#"
+        let res = target.value_by_path("users.[_].age", curr_path);
+        res == 33
+        "#;
+
+        let diff = DiffBuilder::default()
+            .source(obj1)
+            .target(obj2)
+            .ignore_path_with_condition("users.[_].animals.type", IgnorePathCondition::Rhai(script.to_string()))
+            .build();
+        let diff = diff.unwrap().compare();
+
+        assert!(diff.is_none(), "{:?}", diff);
+    }
 
     #[test]
     fn ignore_source_missing() {
@@ -673,5 +819,29 @@ mod tests {
         let diff = diff.compare();
 
         assert_eq!(true, diff.is_none(), "diff should be None, but got: {:?}", diff);
+    }
+
+    #[test]
+    fn test_replace_array_index_all_by_exact_path() {
+        let pattern_path: Path = vec![
+            PathElement::Key("users".to_string()),
+            PathElement::ArrayIndex(ArrayIndex::All),
+            PathElement::Key("address".to_string()),
+        ].into();
+
+        let exact_path: Path = vec![
+            PathElement::Key("users".to_string()),
+            PathElement::ArrayIndex(ArrayIndex::Index(1)),
+            PathElement::Key("name".to_string()),
+        ].into();
+
+        let actual = pattern_path.replace_array_index_all_by_exact_path(exact_path);
+        let expected: Path = vec![
+            PathElement::Key("users".to_string()),
+            PathElement::ArrayIndex(ArrayIndex::Index(1)),
+            PathElement::Key("address".to_string()),
+        ].into();
+        assert!(actual.is_some());
+        assert_eq!(actual.unwrap(), expected);
     }
 }
