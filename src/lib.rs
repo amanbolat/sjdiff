@@ -465,7 +465,7 @@ impl Diff {
             (false, false, true) => true,
             (false, true, false) => true,
             (false, false, false) => false,
-            (_, _, _) => false
+            (false, true, true) => true,
         }
     }
 }
